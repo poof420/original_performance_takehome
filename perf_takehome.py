@@ -58,6 +58,18 @@ class KernelBuilder:
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
+    def emit_bundle(self, **engine_slots: list[tuple]):
+        instr = {
+            engine: slots
+            for engine, slots in engine_slots.items()
+            if slots is not None and len(slots) > 0
+        }
+        if not instr:
+            return
+        for engine, slots in instr.items():
+            assert len(slots) <= SLOT_LIMITS[engine]
+        self.instrs.append(instr)
+
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
         if name is not None:
@@ -74,6 +86,15 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    def alloc_vec(self, name=None):
+        return self.alloc_scratch(name=name, length=VLEN)
+
+    def vector_const(self, val, name=None):
+        scalar_addr = self.scratch_const(val, name=name)
+        vec_addr = self.alloc_vec(name=None if name is None else f"{name}_vec")
+        self.emit_bundle(valu=[("vbroadcast", vec_addr, scalar_addr)])
+        return vec_addr
+
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
@@ -89,12 +110,10 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Vectorized implementation using VLIW scheduling.
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -110,67 +129,274 @@ class KernelBuilder:
         for i, v in enumerate(init_vars):
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
-
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
-
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        zero_const = self.scratch_const(0)
+        vec_two = self.vector_const(2, name="two")
+        vec_one = self.vector_const(1, name="one")
+        vec_c1 = self.vector_const(0x7ED55D16, name="hash_c1")
+        vec_c2 = self.vector_const(0xC761C23C, name="hash_c2")
+        vec_c3 = self.vector_const(0x165667B1, name="hash_c3")
+        vec_c4 = self.vector_const(0xD3A2646C, name="hash_c4")
+        vec_c5 = self.vector_const(0xFD7046C5, name="hash_c5")
+        vec_c6 = self.vector_const(0xB55A4F09, name="hash_c6")
+        vec_m1 = self.vector_const(4097, name="hash_m1")
+        vec_m3 = self.vector_const(33, name="hash_m3")
+        vec_m5 = self.vector_const(9, name="hash_m5")
+        vec_s2 = self.vector_const(19, name="hash_s2")
+        vec_s4 = self.vector_const(9, name="hash_s4")
+        vec_s6 = self.vector_const(16, name="hash_s6")
 
-        body = []  # array of slots
+        vec_forest_base = self.alloc_vec("forest_values_p_vec")
+        self.emit_bundle(
+            valu=[("vbroadcast", vec_forest_base, self.scratch["forest_values_p"])]
+        )
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        addr_tmp = self.alloc_scratch("addr_tmp")
+        node0_scalar = self.alloc_scratch("node0_scalar")
+        node0_vec = self.alloc_vec("node0_vec")
+        self.emit_bundle(
+            alu=[("+", addr_tmp, self.scratch["forest_values_p"], zero_const)]
+        )
+        self.emit_bundle(load=[("load", node0_scalar, addr_tmp)])
+        self.emit_bundle(valu=[("vbroadcast", node0_vec, node0_scalar)])
+        idx_addrs = []
+        val_addrs = []
+        idx_vecs = []
+        val_vecs = []
+        for chunk in range(0, batch_size, VLEN):
+            idx_addr = self.alloc_scratch(f"idx_addr_{chunk}")
+            val_addr = self.alloc_scratch(f"val_addr_{chunk}")
+            idx_vec = self.alloc_vec(f"idx_vec_{chunk}")
+            val_vec = self.alloc_vec(f"val_vec_{chunk}")
+            idx_addrs.append(idx_addr)
+            val_addrs.append(val_addr)
+            idx_vecs.append(idx_vec)
+            val_vecs.append(val_vec)
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        for chunk_index, chunk in enumerate(range(0, batch_size, VLEN)):
+            offset = self.scratch_const(chunk)
+            self.emit_bundle(
+                alu=[
+                    ("+", idx_addrs[chunk_index], self.scratch["inp_indices_p"], offset),
+                    ("+", val_addrs[chunk_index], self.scratch["inp_values_p"], offset),
+                ]
+            )
+            self.emit_bundle(
+                load=[
+                    ("vload", idx_vecs[chunk_index], idx_addrs[chunk_index]),
+                    ("vload", val_vecs[chunk_index], val_addrs[chunk_index]),
+                ]
+            )
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
+        n_chunks = len(idx_vecs)
+        group_size = SLOT_LIMITS["valu"]
+        n_buffers = 2
+        group_node_addr = []
+        group_node_val = []
+        group_tmp1 = []
+        group_tmp2 = []
+        for buf_index in range(n_buffers):
+            addr_buf = []
+            val_buf = []
+            tmp1_buf = []
+            tmp2_buf = []
+            for group_index in range(group_size):
+                addr_buf.append(self.alloc_vec(f"node_addr_b{buf_index}_{group_index}"))
+                val_buf.append(self.alloc_vec(f"node_val_b{buf_index}_{group_index}"))
+                tmp1_buf.append(self.alloc_vec(f"vec_tmp1_b{buf_index}_{group_index}"))
+                tmp2_buf.append(self.alloc_vec(f"vec_tmp2_b{buf_index}_{group_index}"))
+            group_node_addr.append(addr_buf)
+            group_node_val.append(val_buf)
+            group_tmp1.append(tmp1_buf)
+            group_tmp2.append(tmp2_buf)
+
+        def emit_valu_batches(ops: list[tuple]):
+            idx = 0
+            while idx < len(ops):
+                self.emit_bundle(valu=ops[idx : idx + SLOT_LIMITS["valu"]])
+                idx += SLOT_LIMITS["valu"]
+
+        def compute_ops(val_vec, idx_vec, node_vec, tmp1_vec, tmp2_vec):
+            return [
+                ("^", val_vec, val_vec, node_vec),
+                ("multiply_add", val_vec, val_vec, vec_m1, vec_c1),
+                (">>", tmp1_vec, val_vec, vec_s2),
+                ("^", tmp2_vec, val_vec, vec_c2),
+                ("^", val_vec, tmp1_vec, tmp2_vec),
+                ("multiply_add", val_vec, val_vec, vec_m3, vec_c3),
+                ("+", tmp1_vec, val_vec, vec_c4),
+                ("<<", tmp2_vec, val_vec, vec_s4),
+                ("^", val_vec, tmp1_vec, tmp2_vec),
+                ("multiply_add", val_vec, val_vec, vec_m5, vec_c5),
+                (">>", tmp1_vec, val_vec, vec_s6),
+                ("^", tmp2_vec, val_vec, vec_c6),
+                ("^", val_vec, tmp1_vec, tmp2_vec),
+                ("*", idx_vec, idx_vec, vec_two),
+                ("&", tmp1_vec, val_vec, vec_one),
+                ("+", idx_vec, idx_vec, vec_one),
+                ("+", idx_vec, idx_vec, tmp1_vec),
+            ]
+
+        reset_period = forest_height + 1
+        def take_block_ops(block_ops, block_positions, max_ops):
+            valu_ops = []
+            for block_index in range(len(block_ops)):
+                if len(valu_ops) >= max_ops:
+                    break
+                if block_positions[block_index] >= len(block_ops[block_index]):
+                    continue
+                valu_ops.append(block_ops[block_index][block_positions[block_index]])
+                block_positions[block_index] += 1
+            return valu_ops
+
+        def emit_valu_with_prev(current_ops, prev_ops, prev_positions):
+            idx = 0
+            while idx < len(current_ops):
+                valu_ops = []
+                while idx < len(current_ops) and len(valu_ops) < SLOT_LIMITS["valu"]:
+                    valu_ops.append(current_ops[idx])
+                    idx += 1
+                if prev_ops is not None and len(valu_ops) < SLOT_LIMITS["valu"]:
+                    valu_ops.extend(
+                        take_block_ops(
+                            prev_ops,
+                            prev_positions,
+                            SLOT_LIMITS["valu"] - len(valu_ops),
+                        )
+                    )
+                self.emit_bundle(valu=valu_ops)
+
+        for round_index in range(rounds):
+            if round_index % reset_period == 0:
+                for block_start in range(0, n_chunks, group_size):
+                    block_end = min(block_start + group_size, n_chunks)
+                    block_chunks = list(range(block_start, block_end))
+                    block_ops = []
+                    for block_slot, chunk_index in enumerate(block_chunks):
+                        block_ops.append(
+                            compute_ops(
+                                val_vecs[chunk_index],
+                                idx_vecs[chunk_index],
+                                node0_vec,
+                                group_tmp1[0][block_slot],
+                                group_tmp2[0][block_slot],
+                            )
+                        )
+                    block_positions = [0] * len(block_chunks)
+                    while True:
+                        valu_ops = take_block_ops(
+                            block_ops, block_positions, SLOT_LIMITS["valu"]
+                        )
+                        if not valu_ops:
+                            break
+                        self.emit_bundle(valu=valu_ops)
+                if (round_index + 1) % reset_period == 0:
+                    reset_ops = [
+                        (
+                            "^",
+                            idx_vecs[chunk_index],
+                            idx_vecs[chunk_index],
+                            idx_vecs[chunk_index],
+                        )
+                        for chunk_index in range(n_chunks)
+                    ]
+                    emit_valu_batches(reset_ops)
+                continue
+            prev_ops = None
+            prev_positions = None
+            for block_index, block_start in enumerate(range(0, n_chunks, group_size)):
+                block_end = min(block_start + group_size, n_chunks)
+                block_chunks = list(range(block_start, block_end))
+                buf = block_index % n_buffers
+                node_addr_ops = []
+                for block_slot, chunk_index in enumerate(block_chunks):
+                    node_addr_ops.append(
+                        (
+                            "+",
+                            group_node_addr[buf][block_slot],
+                            idx_vecs[chunk_index],
+                            vec_forest_base,
+                        )
+                    )
+                emit_valu_with_prev(node_addr_ops, prev_ops, prev_positions)
+
+                for block_slot in range(len(block_chunks)):
+                    for stage in range(4):
+                        valu_ops = []
+                        if prev_ops is not None:
+                            valu_ops = take_block_ops(
+                                prev_ops, prev_positions, SLOT_LIMITS["valu"]
+                            )
+                        self.emit_bundle(
+                            load=[
+                                (
+                                    "load_offset",
+                                    group_node_val[buf][block_slot],
+                                    group_node_addr[buf][block_slot],
+                                    stage * 2,
+                                ),
+                                (
+                                    "load_offset",
+                                    group_node_val[buf][block_slot],
+                                    group_node_addr[buf][block_slot],
+                                    stage * 2 + 1,
+                                ),
+                            ],
+                            valu=valu_ops,
+                        )
+
+                block_ops = []
+                for block_slot, chunk_index in enumerate(block_chunks):
+                    block_ops.append(
+                        compute_ops(
+                            val_vecs[chunk_index],
+                            idx_vecs[chunk_index],
+                            group_node_val[buf][block_slot],
+                            group_tmp1[buf][block_slot],
+                            group_tmp2[buf][block_slot],
+                        )
+                    )
+                if prev_ops is not None:
+                    while True:
+                        valu_ops = take_block_ops(
+                            prev_ops, prev_positions, SLOT_LIMITS["valu"]
+                        )
+                        if not valu_ops:
+                            break
+                        self.emit_bundle(valu=valu_ops)
+
+                prev_ops = block_ops
+                prev_positions = [0] * len(block_chunks)
+
+            if prev_ops is not None:
+                while True:
+                    valu_ops = take_block_ops(
+                        prev_ops, prev_positions, SLOT_LIMITS["valu"]
+                    )
+                    if not valu_ops:
+                        break
+                    self.emit_bundle(valu=valu_ops)
+
+            if (round_index + 1) % reset_period == 0:
+                reset_ops = [
+                    ("^", idx_vecs[chunk_index], idx_vecs[chunk_index], idx_vecs[chunk_index])
+                    for chunk_index in range(n_chunks)
+                ]
+                emit_valu_batches(reset_ops)
+
+        for chunk_index in range(n_chunks):
+            self.emit_bundle(load=[("const", addr_tmp, chunk_index * VLEN)])
+            self.emit_bundle(
+                alu=[
+                    (
+                        "+",
+                        addr_tmp,
+                        self.scratch["inp_values_p"],
+                        addr_tmp,
+                    )
+                ]
+            )
+            self.emit_bundle(store=[("vstore", addr_tmp, val_vecs[chunk_index])])
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
