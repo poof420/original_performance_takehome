@@ -267,6 +267,8 @@ class KernelBuilder:
                 self.emit_bundle(valu=valu_ops)
 
         for round_index in range(rounds):
+            prev_ops = None
+            prev_positions = None
             if round_index % reset_period == 0:
                 for block_start in range(0, n_chunks, group_size):
                     block_end = min(block_start + group_size, n_chunks)
@@ -302,8 +304,6 @@ class KernelBuilder:
                     ]
                     emit_valu_batches(reset_ops)
                 continue
-            prev_ops = None
-            prev_positions = None
             for block_index, block_start in enumerate(range(0, n_chunks, group_size)):
                 block_end = min(block_start + group_size, n_chunks)
                 block_chunks = list(range(block_start, block_end))
