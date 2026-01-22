@@ -266,7 +266,20 @@ class KernelBuilder:
                     )
                 self.emit_bundle(valu=valu_ops)
 
+        def emit_reset_ops():
+            reset_ops = [
+                (
+                    "^",
+                    idx_vecs[chunk_index],
+                    idx_vecs[chunk_index],
+                    idx_vecs[chunk_index],
+                )
+                for chunk_index in range(n_chunks)
+            ]
+            emit_valu_batches(reset_ops)
+
         for round_index in range(rounds):
+            should_reset = (round_index + 1) % reset_period == 0
             if round_index % reset_period == 0:
                 for block_start in range(0, n_chunks, group_size):
                     block_end = min(block_start + group_size, n_chunks)
@@ -290,17 +303,8 @@ class KernelBuilder:
                         if not valu_ops:
                             break
                         self.emit_bundle(valu=valu_ops)
-                if (round_index + 1) % reset_period == 0:
-                    reset_ops = [
-                        (
-                            "^",
-                            idx_vecs[chunk_index],
-                            idx_vecs[chunk_index],
-                            idx_vecs[chunk_index],
-                        )
-                        for chunk_index in range(n_chunks)
-                    ]
-                    emit_valu_batches(reset_ops)
+                if should_reset:
+                    emit_reset_ops()
                 continue
             prev_ops = None
             prev_positions = None
@@ -377,12 +381,8 @@ class KernelBuilder:
                         break
                     self.emit_bundle(valu=valu_ops)
 
-            if (round_index + 1) % reset_period == 0:
-                reset_ops = [
-                    ("^", idx_vecs[chunk_index], idx_vecs[chunk_index], idx_vecs[chunk_index])
-                    for chunk_index in range(n_chunks)
-                ]
-                emit_valu_batches(reset_ops)
+            if should_reset:
+                emit_reset_ops()
 
         for chunk_index in range(n_chunks):
             self.emit_bundle(load=[("const", addr_tmp, chunk_index * VLEN)])
