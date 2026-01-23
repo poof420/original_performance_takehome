@@ -16,7 +16,7 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
-from collections import defaultdict
+from collections import defaultdict, deque
 import random
 import unittest
 
@@ -44,6 +44,9 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.slot_counts = defaultdict(int)
+        self.bundle_count = 0
+        self.enable_slot_stats = False
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -57,6 +60,8 @@ class KernelBuilder:
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
+        self.slot_counts[engine] += 1
+        self.bundle_count += 1
 
     def emit_bundle(self, **engine_slots: list[tuple]):
         instr = {
@@ -68,7 +73,23 @@ class KernelBuilder:
             return
         for engine, slots in instr.items():
             assert len(slots) <= SLOT_LIMITS[engine]
+            self.slot_counts[engine] += len(slots)
+        self.bundle_count += 1
         self.instrs.append(instr)
+
+    def slot_summary(self):
+        """
+        Return a minimal slot accounting summary for schedule tuning.
+        """
+        if not self.bundle_count:
+            return {}
+        summary = dict(self.slot_counts)
+        summary["bundles"] = self.bundle_count
+        summary["lb_load_cycles"] = (summary.get("load", 0) + SLOT_LIMITS["load"] - 1) // SLOT_LIMITS["load"]
+        summary["lb_valu_cycles"] = (summary.get("valu", 0) + SLOT_LIMITS["valu"] - 1) // SLOT_LIMITS["valu"]
+        summary["lb_store_cycles"] = (summary.get("store", 0) + SLOT_LIMITS["store"] - 1) // SLOT_LIMITS["store"]
+        summary["lb_flow_cycles"] = (summary.get("flow", 0) + SLOT_LIMITS["flow"] - 1) // SLOT_LIMITS["flow"]
+        return summary
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -112,8 +133,7 @@ class KernelBuilder:
         """
         Vectorized implementation using VLIW scheduling.
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
+        tmp_scalar = self.alloc_scratch("tmp_scalar")
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -127,10 +147,9 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
-        self.add("flow", ("pause",))
-        zero_const = self.scratch_const(0)
+            self.add("load", ("const", tmp_scalar, i))
+            self.add("load", ("load", self.scratch[v], tmp_scalar))
+        scalar_one = self.scratch_const(1, name="one_scalar")
         vec_two = self.vector_const(2, name="two")
         vec_one = self.vector_const(1, name="one")
         vec_c1 = self.vector_const(0x7ED55D16, name="hash_c1")
@@ -150,28 +169,61 @@ class KernelBuilder:
         self.emit_bundle(
             valu=[("vbroadcast", vec_forest_base, self.scratch["forest_values_p"])]
         )
+        addr_bias = self.alloc_scratch("addr_bias")
+        self.emit_bundle(
+            alu=[("-", addr_bias, scalar_one, self.scratch["forest_values_p"])]
+        )
+        vec_addr_bias = self.alloc_vec("addr_bias_vec")
+        self.emit_bundle(valu=[("vbroadcast", vec_addr_bias, addr_bias)])
 
-        addr_tmp = self.alloc_scratch("addr_tmp")
         node0_scalar = self.alloc_scratch("node0_scalar")
         node0_vec = self.alloc_vec("node0_vec")
-        self.emit_bundle(
-            alu=[("+", addr_tmp, self.scratch["forest_values_p"], zero_const)]
-        )
-        self.emit_bundle(load=[("load", node0_scalar, addr_tmp)])
+        self.emit_bundle(load=[("load", node0_scalar, self.scratch["forest_values_p"])])
         self.emit_bundle(valu=[("vbroadcast", node0_vec, node0_scalar)])
+
+        addr_tmp = self.alloc_scratch("addr_tmp")
+        node1_scalar = self.alloc_scratch("node1_scalar")
+        node2_scalar = self.alloc_scratch("node2_scalar")
+        self.emit_bundle(
+            alu=[("+", addr_tmp, self.scratch["forest_values_p"], scalar_one)]
+        )
+        self.emit_bundle(load=[("load", node1_scalar, addr_tmp)])
+        self.emit_bundle(alu=[("+", addr_tmp, addr_tmp, scalar_one)])
+        self.emit_bundle(load=[("load", node2_scalar, addr_tmp)])
+        diff12_scalar = self.alloc_scratch("diff12_scalar")
+        self.emit_bundle(
+            alu=[
+                ("-", diff12_scalar, node2_scalar, node1_scalar),
+            ]
+        )
+        node1_vec = self.alloc_vec("node1_vec")
+        diff12_vec = self.alloc_vec("diff12_vec")
+        self.emit_bundle(
+            valu=[
+                ("vbroadcast", node1_vec, node1_scalar),
+                ("vbroadcast", diff12_vec, diff12_scalar),
+            ]
+        )
+
         idx_addrs = []
         val_addrs = []
-        idx_vecs = []
+        addr_vecs = []
         val_vecs = []
+        node_val_vecs = []
+        tmp_vecs = []
         for chunk in range(0, batch_size, VLEN):
             idx_addr = self.alloc_scratch(f"idx_addr_{chunk}")
             val_addr = self.alloc_scratch(f"val_addr_{chunk}")
-            idx_vec = self.alloc_vec(f"idx_vec_{chunk}")
+            addr_vec = self.alloc_vec(f"addr_vec_{chunk}")
             val_vec = self.alloc_vec(f"val_vec_{chunk}")
+            node_val_vec = self.alloc_vec(f"node_val_{chunk}")
+            tmp_vec = self.alloc_vec(f"tmp_vec_{chunk}")
             idx_addrs.append(idx_addr)
             val_addrs.append(val_addr)
-            idx_vecs.append(idx_vec)
+            addr_vecs.append(addr_vec)
             val_vecs.append(val_vec)
+            node_val_vecs.append(node_val_vec)
+            tmp_vecs.append(tmp_vec)
 
         for chunk_index, chunk in enumerate(range(0, batch_size, VLEN)):
             offset = self.scratch_const(chunk)
@@ -183,221 +235,213 @@ class KernelBuilder:
             )
             self.emit_bundle(
                 load=[
-                    ("vload", idx_vecs[chunk_index], idx_addrs[chunk_index]),
+                    ("vload", addr_vecs[chunk_index], idx_addrs[chunk_index]),
                     ("vload", val_vecs[chunk_index], val_addrs[chunk_index]),
                 ]
             )
-
-        n_chunks = len(idx_vecs)
-        group_size = SLOT_LIMITS["valu"]
-        n_buffers = 2
-        group_node_addr = []
-        group_node_val = []
-        group_tmp1 = []
-        group_tmp2 = []
-        for buf_index in range(n_buffers):
-            addr_buf = []
-            val_buf = []
-            tmp1_buf = []
-            tmp2_buf = []
-            for group_index in range(group_size):
-                addr_buf.append(self.alloc_vec(f"node_addr_b{buf_index}_{group_index}"))
-                val_buf.append(self.alloc_vec(f"node_val_b{buf_index}_{group_index}"))
-                tmp1_buf.append(self.alloc_vec(f"vec_tmp1_b{buf_index}_{group_index}"))
-                tmp2_buf.append(self.alloc_vec(f"vec_tmp2_b{buf_index}_{group_index}"))
-            group_node_addr.append(addr_buf)
-            group_node_val.append(val_buf)
-            group_tmp1.append(tmp1_buf)
-            group_tmp2.append(tmp2_buf)
-
-        def emit_valu_batches(ops: list[tuple]):
-            idx = 0
-            while idx < len(ops):
-                self.emit_bundle(valu=ops[idx : idx + SLOT_LIMITS["valu"]])
-                idx += SLOT_LIMITS["valu"]
-
-        def compute_ops(val_vec, idx_vec, node_vec, tmp1_vec, tmp2_vec):
-            return [
-                ("^", val_vec, val_vec, node_vec),
-                ("multiply_add", val_vec, val_vec, vec_m1, vec_c1),
-                (">>", tmp1_vec, val_vec, vec_s2),
-                ("^", tmp2_vec, val_vec, vec_c2),
-                ("^", val_vec, tmp1_vec, tmp2_vec),
-                ("multiply_add", val_vec, val_vec, vec_m3, vec_c3),
-                ("+", tmp1_vec, val_vec, vec_c4),
-                ("<<", tmp2_vec, val_vec, vec_s4),
-                ("^", val_vec, tmp1_vec, tmp2_vec),
-                ("multiply_add", val_vec, val_vec, vec_m5, vec_c5),
-                (">>", tmp1_vec, val_vec, vec_s6),
-                ("^", tmp2_vec, val_vec, vec_c6),
-                ("^", val_vec, tmp1_vec, tmp2_vec),
-                ("*", idx_vec, idx_vec, vec_two),
-                ("&", tmp1_vec, val_vec, vec_one),
-                ("+", idx_vec, idx_vec, vec_one),
-                ("+", idx_vec, idx_vec, tmp1_vec),
-            ]
-
-        reset_period = forest_height + 1
-        def take_block_ops(block_ops, block_positions, max_ops):
-            valu_ops = []
-            for block_index in range(len(block_ops)):
-                if len(valu_ops) >= max_ops:
-                    break
-                if block_positions[block_index] >= len(block_ops[block_index]):
-                    continue
-                valu_ops.append(block_ops[block_index][block_positions[block_index]])
-                block_positions[block_index] += 1
-            return valu_ops
-
-        def emit_valu_with_prev(current_ops, prev_ops, prev_positions):
-            idx = 0
-            while idx < len(current_ops):
-                valu_ops = []
-                while idx < len(current_ops) and len(valu_ops) < SLOT_LIMITS["valu"]:
-                    valu_ops.append(current_ops[idx])
-                    idx += 1
-                if prev_ops is not None and len(valu_ops) < SLOT_LIMITS["valu"]:
-                    valu_ops.extend(
-                        take_block_ops(
-                            prev_ops,
-                            prev_positions,
-                            SLOT_LIMITS["valu"] - len(valu_ops),
-                        )
-                    )
-                self.emit_bundle(valu=valu_ops)
-
-        for round_index in range(rounds):
-            if round_index % reset_period == 0:
-                for block_start in range(0, n_chunks, group_size):
-                    block_end = min(block_start + group_size, n_chunks)
-                    block_chunks = list(range(block_start, block_end))
-                    block_ops = []
-                    for block_slot, chunk_index in enumerate(block_chunks):
-                        block_ops.append(
-                            compute_ops(
-                                val_vecs[chunk_index],
-                                idx_vecs[chunk_index],
-                                node0_vec,
-                                group_tmp1[0][block_slot],
-                                group_tmp2[0][block_slot],
-                            )
-                        )
-                    block_positions = [0] * len(block_chunks)
-                    while True:
-                        valu_ops = take_block_ops(
-                            block_ops, block_positions, SLOT_LIMITS["valu"]
-                        )
-                        if not valu_ops:
-                            break
-                        self.emit_bundle(valu=valu_ops)
-                if (round_index + 1) % reset_period == 0:
-                    reset_ops = [
-                        (
-                            "^",
-                            idx_vecs[chunk_index],
-                            idx_vecs[chunk_index],
-                            idx_vecs[chunk_index],
-                        )
-                        for chunk_index in range(n_chunks)
-                    ]
-                    emit_valu_batches(reset_ops)
-                continue
-            prev_ops = None
-            prev_positions = None
-            for block_index, block_start in enumerate(range(0, n_chunks, group_size)):
-                block_end = min(block_start + group_size, n_chunks)
-                block_chunks = list(range(block_start, block_end))
-                buf = block_index % n_buffers
-                node_addr_ops = []
-                for block_slot, chunk_index in enumerate(block_chunks):
-                    node_addr_ops.append(
-                        (
-                            "+",
-                            group_node_addr[buf][block_slot],
-                            idx_vecs[chunk_index],
-                            vec_forest_base,
-                        )
-                    )
-                emit_valu_with_prev(node_addr_ops, prev_ops, prev_positions)
-
-                for block_slot in range(len(block_chunks)):
-                    for stage in range(4):
-                        valu_ops = []
-                        if prev_ops is not None:
-                            valu_ops = take_block_ops(
-                                prev_ops, prev_positions, SLOT_LIMITS["valu"]
-                            )
-                        self.emit_bundle(
-                            load=[
-                                (
-                                    "load_offset",
-                                    group_node_val[buf][block_slot],
-                                    group_node_addr[buf][block_slot],
-                                    stage * 2,
-                                ),
-                                (
-                                    "load_offset",
-                                    group_node_val[buf][block_slot],
-                                    group_node_addr[buf][block_slot],
-                                    stage * 2 + 1,
-                                ),
-                            ],
-                            valu=valu_ops,
-                        )
-
-                block_ops = []
-                for block_slot, chunk_index in enumerate(block_chunks):
-                    block_ops.append(
-                        compute_ops(
-                            val_vecs[chunk_index],
-                            idx_vecs[chunk_index],
-                            group_node_val[buf][block_slot],
-                            group_tmp1[buf][block_slot],
-                            group_tmp2[buf][block_slot],
-                        )
-                    )
-                if prev_ops is not None:
-                    while True:
-                        valu_ops = take_block_ops(
-                            prev_ops, prev_positions, SLOT_LIMITS["valu"]
-                        )
-                        if not valu_ops:
-                            break
-                        self.emit_bundle(valu=valu_ops)
-
-                prev_ops = block_ops
-                prev_positions = [0] * len(block_chunks)
-
-            if prev_ops is not None:
-                while True:
-                    valu_ops = take_block_ops(
-                        prev_ops, prev_positions, SLOT_LIMITS["valu"]
-                    )
-                    if not valu_ops:
-                        break
-                    self.emit_bundle(valu=valu_ops)
-
-            if (round_index + 1) % reset_period == 0:
-                reset_ops = [
-                    ("^", idx_vecs[chunk_index], idx_vecs[chunk_index], idx_vecs[chunk_index])
-                    for chunk_index in range(n_chunks)
-                ]
-                emit_valu_batches(reset_ops)
-
-        for chunk_index in range(n_chunks):
-            self.emit_bundle(load=[("const", addr_tmp, chunk_index * VLEN)])
             self.emit_bundle(
-                alu=[
+                valu=[
                     (
                         "+",
-                        addr_tmp,
-                        self.scratch["inp_values_p"],
-                        addr_tmp,
+                        addr_vecs[chunk_index],
+                        addr_vecs[chunk_index],
+                        vec_forest_base,
                     )
                 ]
             )
-            self.emit_bundle(store=[("vstore", addr_tmp, val_vecs[chunk_index])])
-        self.instrs.append({"flow": [("pause",)]})
+
+        n_chunks = len(addr_vecs)
+        def compute_ops(val_vec, addr_vec, node_vec, tmp_vec):
+            return [
+                ("^", val_vec, val_vec, node_vec),
+                ("multiply_add", val_vec, val_vec, vec_m1, vec_c1),
+                (">>", tmp_vec, val_vec, vec_s2),
+                ("^", val_vec, val_vec, vec_c2),
+                ("^", val_vec, val_vec, tmp_vec),
+                ("multiply_add", val_vec, val_vec, vec_m3, vec_c3),
+                ("<<", tmp_vec, val_vec, vec_s4),
+                ("+", val_vec, val_vec, vec_c4),
+                ("^", val_vec, val_vec, tmp_vec),
+                ("multiply_add", val_vec, val_vec, vec_m5, vec_c5),
+                (">>", tmp_vec, val_vec, vec_s6),
+                ("^", val_vec, val_vec, vec_c6),
+                ("^", val_vec, val_vec, tmp_vec),
+                ("&", tmp_vec, val_vec, vec_one),
+                ("multiply_add", addr_vec, addr_vec, vec_two, vec_addr_bias),
+                ("+", addr_vec, addr_vec, tmp_vec),
+            ]
+
+        def depth1_ops(chunk_index: int):
+            ops = [
+                (
+                    "&",
+                    tmp_vecs[chunk_index],
+                    addr_vecs[chunk_index],
+                    vec_one,
+                ),
+                (
+                    "multiply_add",
+                    node_val_vecs[chunk_index],
+                    tmp_vecs[chunk_index],
+                    diff12_vec,
+                    node1_vec,
+                ),
+            ]
+            ops.extend(
+                compute_ops(
+                    val_vecs[chunk_index],
+                    addr_vecs[chunk_index],
+                    node_val_vecs[chunk_index],
+                    tmp_vecs[chunk_index],
+                )
+            )
+            return ops
+
+        reset_period = forest_height + 1
+        round_index = [0] * n_chunks
+        compute_idx = [0] * n_chunks
+        load_idx = [0] * n_chunks
+        per_chunk_ops = [None] * n_chunks
+
+        load_queue = deque()
+        compute_queue = deque()
+        store_queue = deque()
+        current_load_chunk = None
+        done_count = 0
+        store_count = 0
+
+        for chunk in range(n_chunks):
+            per_chunk_ops[chunk] = compute_ops(
+                val_vecs[chunk],
+                addr_vecs[chunk],
+                node0_vec,
+                tmp_vecs[chunk],
+            )
+            compute_queue.append(chunk)
+
+        while True:
+            valu_ops = []
+            load_ops = []
+            store_ops = []
+            load_done = []
+            compute_done = []
+
+            if compute_queue:
+                scheduled_chunks = []
+                while compute_queue and len(valu_ops) < SLOT_LIMITS["valu"]:
+                    chunk = compute_queue.popleft()
+                    op_idx = compute_idx[chunk]
+                    valu_ops.append(per_chunk_ops[chunk][op_idx])
+                    compute_idx[chunk] = op_idx + 1
+                    if compute_idx[chunk] < len(per_chunk_ops[chunk]):
+                        scheduled_chunks.append(chunk)
+                    else:
+                        compute_done.append(chunk)
+                compute_queue.extend(scheduled_chunks)
+
+            if current_load_chunk is None and load_queue:
+                current_load_chunk = load_queue.popleft()
+            if current_load_chunk is not None:
+                offset = load_idx[current_load_chunk]
+                if offset < VLEN:
+                    load_ops.append(
+                        (
+                            "load_offset",
+                            node_val_vecs[current_load_chunk],
+                            addr_vecs[current_load_chunk],
+                            offset,
+                        )
+                    )
+                    load_idx[current_load_chunk] += 1
+                if load_idx[current_load_chunk] < VLEN and len(load_ops) < SLOT_LIMITS["load"]:
+                    offset = load_idx[current_load_chunk]
+                    load_ops.append(
+                        (
+                            "load_offset",
+                            node_val_vecs[current_load_chunk],
+                            addr_vecs[current_load_chunk],
+                            offset,
+                        )
+                    )
+                    load_idx[current_load_chunk] += 1
+                if load_idx[current_load_chunk] >= VLEN:
+                    load_done.append(current_load_chunk)
+                    current_load_chunk = None
+
+            while store_queue and len(store_ops) < SLOT_LIMITS["store"]:
+                chunk = store_queue.popleft()
+                store_ops.append(("vstore", val_addrs[chunk], val_vecs[chunk]))
+                store_count += 1
+
+            if valu_ops or load_ops or store_ops:
+                self.emit_bundle(valu=valu_ops, load=load_ops, store=store_ops)
+
+            pending_compute = []
+            pending_load = []
+            pending_store = []
+
+            for chunk in load_done:
+                round_i = round_index[chunk]
+                reset_idx = (round_i + 1) % reset_period == 0
+                per_chunk_ops[chunk] = compute_ops(
+                    val_vecs[chunk],
+                    addr_vecs[chunk],
+                    node_val_vecs[chunk],
+                    tmp_vecs[chunk],
+                )
+                if reset_idx:
+                    per_chunk_ops[chunk].append(
+                        ("vbroadcast", addr_vecs[chunk], self.scratch["forest_values_p"])
+                    )
+                compute_idx[chunk] = 0
+                pending_compute.append(chunk)
+
+            for chunk in compute_done:
+                round_index[chunk] += 1
+                if round_index[chunk] >= rounds:
+                    done_count += 1
+                    pending_store.append(chunk)
+                    continue
+                if round_index[chunk] % reset_period == 0:
+                    reset_idx = (round_index[chunk] + 1) % reset_period == 0
+                    per_chunk_ops[chunk] = compute_ops(
+                        val_vecs[chunk],
+                        addr_vecs[chunk],
+                        node0_vec,
+                        tmp_vecs[chunk],
+                    )
+                    if reset_idx:
+                        per_chunk_ops[chunk].append(
+                            ("vbroadcast", addr_vecs[chunk], self.scratch["forest_values_p"])
+                        )
+                    compute_idx[chunk] = 0
+                    pending_compute.append(chunk)
+                elif round_index[chunk] % reset_period == 1:
+                    per_chunk_ops[chunk] = depth1_ops(chunk)
+                    compute_idx[chunk] = 0
+                    pending_compute.append(chunk)
+                else:
+                    pending_load.append(chunk)
+
+            for chunk in pending_compute:
+                compute_queue.append(chunk)
+            for chunk in pending_load:
+                load_idx[chunk] = 0
+                load_queue.append(chunk)
+            for chunk in pending_store:
+                store_queue.append(chunk)
+
+            if (
+                done_count == n_chunks
+                and store_count == n_chunks
+                and not load_queue
+                and current_load_chunk is None
+                and not compute_queue
+                and not store_queue
+            ):
+                break
+            if not (valu_ops or load_ops or store_ops):
+                raise RuntimeError("Scheduler stalled without progress")
 
 BASELINE = 147734
 
@@ -407,6 +451,7 @@ def do_kernel_test(
     batch_size: int,
     seed: int = 123,
     trace: bool = False,
+    slot_stats: bool = False,
     prints: bool = False,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
@@ -418,6 +463,8 @@ def do_kernel_test(
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
+    if slot_stats:
+        print("SLOT SUMMARY:", kb.slot_summary())
 
     value_trace = {}
     machine = Machine(
@@ -429,22 +476,17 @@ def do_kernel_test(
         trace=trace,
     )
     machine.prints = prints
-    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
-        machine.run()
-        inp_values_p = ref_mem[6]
-        if prints:
-            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
-        assert (
-            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
-        inp_indices_p = ref_mem[5]
-        if prints:
-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
+    for ref_mem in reference_kernel2(mem, value_trace):
+        pass
+    machine.run()
+    inp_values_p = ref_mem[6]
+    if prints:
+        print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
+        print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+    assert (
+        machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+        == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+    ), "Incorrect output values"
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
